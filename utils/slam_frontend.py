@@ -19,7 +19,7 @@ class FrontEnd(mp.Process):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.background = None
+        self.background = None # background color [0, 0, 0] by default
         self.pipeline_params = None
         self.frontend_queue = None
         self.backend_queue = None
@@ -126,6 +126,7 @@ class FrontEnd(mp.Process):
         self.reset = False
 
     def tracking(self, cur_frame_idx, viewpoint):
+        """ Tracking the current frame pose using 3DGS rendering and optimization """
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         viewpoint.update_RT(prev.R, prev.T)
 
@@ -326,6 +327,7 @@ class FrontEnd(mp.Process):
             H=self.dataset.height,
         ).transpose(0, 1)
         projection_matrix = projection_matrix.to(device=self.device)
+        #  GPU timing events
         tic = torch.cuda.Event(enable_timing=True)
         toc = torch.cuda.Event(enable_timing=True)
 
@@ -344,6 +346,7 @@ class FrontEnd(mp.Process):
 
             if self.frontend_queue.empty():
                 tic.record()
+                # check if we have reached the end of the dataset
                 if cur_frame_idx >= len(self.dataset):
                     if self.save_results:
                         eval_ate(

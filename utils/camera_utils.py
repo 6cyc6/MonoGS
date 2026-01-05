@@ -114,8 +114,8 @@ class Camera(nn.Module):
     def compute_grad_mask(self, config):
         edge_threshold = config["Training"]["edge_threshold"]
 
-        gray_img = self.original_image.mean(dim=0, keepdim=True)
-        gray_grad_v, gray_grad_h = image_gradient(gray_img)
+        gray_img = self.original_image.mean(dim=0, keepdim=True) # convert to gray scale
+        gray_grad_v, gray_grad_h = image_gradient(gray_img) # compute image gradients
         mask_v, mask_h = image_gradient_mask(gray_img)
         gray_grad_v = gray_grad_v * mask_v
         gray_grad_h = gray_grad_h * mask_h

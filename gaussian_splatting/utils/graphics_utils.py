@@ -23,6 +23,7 @@ class BasicPointCloud(NamedTuple):
 
 
 def getWorld2View(R, t):
+    ''' Get world to view matrix from rotation and translation '''
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = R.transpose()
     Rt[:3, 3] = t
@@ -70,6 +71,7 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
 
 
 def getProjectionMatrix2(znear, zfar, cx, cy, fx, fy, W, H):
+    # LH system, +z forward (DirectX)
     left = ((2 * cx - W) / W - 1.0) * W / 2.0
     right = ((2 * cx - W) / W + 1.0) * W / 2.0
     top = ((2 * cy - H) / H + 1.0) * H / 2.0
