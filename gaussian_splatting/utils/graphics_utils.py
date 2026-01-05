@@ -71,7 +71,7 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
 
 
 def getProjectionMatrix2(znear, zfar, cx, cy, fx, fy, W, H):
-    # LH system, +z forward (DirectX)
+    # LH system, +z forward (DirectX), 0 < znear < zfar
     left = ((2 * cx - W) / W - 1.0) * W / 2.0
     right = ((2 * cx - W) / W + 1.0) * W / 2.0
     top = ((2 * cy - H) / H + 1.0) * H / 2.0
