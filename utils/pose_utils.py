@@ -154,36 +154,22 @@ def SE3_exp_Rt(tau: torch.Tensor):
 #     return converged
 
 
-# @torch.no_grad()
-# def update_pose(camera, converged_threshold=1e-4):
-#     tau = torch.cat((camera.cam_trans_delta, camera.cam_rot_delta), dim=0)
-
-#     dR, dt = SE3_exp_Rt(tau)
-
-#     # Apply left-multiplication update: new = exp(tau) @ old
-#     R = camera.R.float()
-#     T = camera.T.float()
-#     new_R = dR @ R
-#     new_T = dR @ T + dt
-
-#     converged = tau.norm() < converged_threshold
-#     camera.update_RT(new_R, new_T)
-
-#     camera.cam_rot_delta.zero_()
-#     camera.cam_trans_delta.zero_()
-    
-#     return converged
-
-
 @torch.no_grad()
 def update_pose(camera, converged_threshold=1e-4):
-    tau = torch.cat([camera.cam_trans_delta,
-                     camera.cam_rot_delta], axis=0)
-    T_w2c = camera.T
-    new_w2c = lietorch.SE3.exp(tau).matrix() @ T_w2c
-    converged = (tau**2).sum() < (converged_threshold**2)
-    camera.T = new_w2c
-    camera.cam_rot_delta.data.fill_(0)
-    camera.cam_trans_delta.data.fill_(0)
+    tau = torch.cat((camera.cam_trans_delta, camera.cam_rot_delta), dim=0)
+
+    dR, dt = SE3_exp_Rt(tau)
+
+    # Apply left-multiplication update: new = exp(tau) @ old
+    R = camera.R.float()
+    T = camera.T.float()
+    new_R = dR @ R
+    new_T = dR @ T + dt
+
+    converged = tau.norm() < converged_threshold
+    camera.update_RT(new_R, new_T)
+
+    camera.cam_rot_delta.zero_()
+    camera.cam_trans_delta.zero_()
     
     return converged
