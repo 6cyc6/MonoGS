@@ -70,6 +70,7 @@ class BackEnd(mp.Process):
         )
 
     def reset(self):
+        """ Reset the backend system """
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.viewpoints = {}
@@ -132,8 +133,9 @@ class BackEnd(mp.Process):
                 ):
                     self.gaussians.reset_opacity()
 
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.gaussians.optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
@@ -304,8 +306,9 @@ class BackEnd(mp.Process):
                     self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                     gaussian_split = True
 
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.gaussians.optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
@@ -347,8 +350,9 @@ class BackEnd(mp.Process):
                     self.gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter],
                 )
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.gaussians.optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(iteration)
         Log("Map refinement done")
 

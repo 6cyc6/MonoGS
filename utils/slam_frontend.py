@@ -335,7 +335,9 @@ class FrontEnd(mp.Process):
             torch.cuda.empty_cache()
 
     def run(self):
+        """ Frontend Process """
         cur_frame_idx = 0
+        # get projection matrix
         projection_matrix = getProjectionMatrix2(
             znear=0.01,
             zfar=100.0,
@@ -487,6 +489,7 @@ class FrontEnd(mp.Process):
                     self.cleanup(cur_frame_idx)
                 cur_frame_idx += 1
 
+                # run ATE evaluation 
                 if (
                     self.save_results
                     and self.save_trj
