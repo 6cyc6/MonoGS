@@ -7,3 +7,6 @@
 [submodule "thirdparty/lietorch"]
 	path = thirdparty/lietorch
 	url = https://github.com/princeton-vl/lietorch.git
+[submodule "submodules/lietorch"]
+	path = submodules/lietorch
+	url = https://github.com/princeton-vl/lietorch.git

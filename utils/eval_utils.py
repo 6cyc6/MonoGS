@@ -149,7 +149,7 @@ def eval_rendering(
 
         psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0))
         # ssim_score = ssim((image).unsqueeze(0), (gt_image).unsqueeze(0))
-        ssim_score = fused_ssim((image).unsqueeze(0), (gt_image).unsqueeze(0))
+        ssim_score = fused_ssim((image).unsqueeze(0), (gt_image).unsqueeze(0), train=False)
         lpips_score = cal_lpips((image).unsqueeze(0), (gt_image).unsqueeze(0))
 
         psnr_array.append(psnr_score.item())
