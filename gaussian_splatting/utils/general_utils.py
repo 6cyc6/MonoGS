@@ -17,8 +17,9 @@ import numpy as np
 import torch
 
 
-def inverse_sigmoid(x):
-    return torch.log(x / (1 - x))
+# @torch.jit.script  # Cannot use with multiprocessing (PickleError)
+def inverse_sigmoid(x) -> torch.Tensor:
+    return torch.logit(x)
 
 
 def PILtoTorch(pil_image, resolution):
@@ -82,70 +83,152 @@ def helper(
     if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
         # Disable this parameter
         return 0.0
-    if lr_delay_steps > 0:
-        # A kind of reverse cosine decay.
+    
+    # Compute delay rate (reverse cosine warmup)
+    if lr_delay_steps > 0 and step < lr_delay_steps:
         delay_rate = lr_delay_mult + (1 - lr_delay_mult) * np.sin(
-            0.5 * np.pi * np.clip(step / lr_delay_steps, 0, 1)
+            0.5 * np.pi * (step / lr_delay_steps)
         )
     else:
         delay_rate = 1.0
-    t = np.clip(step / max_steps, 0, 1)
+    
+    # Compute exponential learning rate decay
+    if step >= max_steps:
+        return lr_final * delay_rate
+    
+    t = step / max_steps
     log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
+    
     return delay_rate * log_lerp
 
 
-def strip_lowerdiag(L):
-    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
+# def strip_lowerdiag(L):
+#     """ Take lower-diagonal matrix to 6-vector """
+#     uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
 
-    uncertainty[:, 0] = L[:, 0, 0]
-    uncertainty[:, 1] = L[:, 0, 1]
-    uncertainty[:, 2] = L[:, 0, 2]
-    uncertainty[:, 3] = L[:, 1, 1]
-    uncertainty[:, 4] = L[:, 1, 2]
-    uncertainty[:, 5] = L[:, 2, 2]
-    return uncertainty
+#     uncertainty[:, 0] = L[:, 0, 0]
+#     uncertainty[:, 1] = L[:, 0, 1]
+#     uncertainty[:, 2] = L[:, 0, 2]
+#     uncertainty[:, 3] = L[:, 1, 1]
+#     uncertainty[:, 4] = L[:, 1, 2]
+#     uncertainty[:, 5] = L[:, 2, 2]
+#     return uncertainty
+
+
+def strip_lowerdiag(L):
+    """ Take lower-diagonal matrix to 6-vector """
+    tri_indices = ([0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2])
+
+    return L[..., tri_indices[0], tri_indices[1]]
 
 
 def strip_symmetric(sym):
+    """ Strip symmetric matrix to 6-vector """
+    # take the lower-diagonal part
     return strip_lowerdiag(sym)
 
 
-def build_rotation(r):
-    norm = torch.sqrt(
-        r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3]
+# def build_rotation(r):
+#     """ Quaternion to rotation matrix """   
+#     # formula (10) in appendix.
+#     norm = torch.sqrt(
+#         r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3]
+#     )
+
+#     q = r / norm[:, None]
+
+#     R = torch.zeros((q.size(0), 3, 3), device="cuda")
+
+#     r = q[:, 0]
+#     x = q[:, 1]
+#     y = q[:, 2]
+#     z = q[:, 3]
+
+#     R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+#     R[:, 0, 1] = 2 * (x * y - r * z)
+#     R[:, 0, 2] = 2 * (x * z + r * y)
+#     R[:, 1, 0] = 2 * (x * y + r * z)
+#     R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+#     R[:, 1, 2] = 2 * (y * z - r * x)
+#     R[:, 2, 0] = 2 * (x * z - r * y)
+#     R[:, 2, 1] = 2 * (y * z + r * x)
+#     R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+#     return R
+
+
+# @torch.jit.script  # Cannot use with multiprocessing (PickleError)
+def normalize(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """Normalizes a given input tensor to unit length.
+
+    Args:
+        x: Input tensor of shape (N, dims).
+        eps: A small value to avoid division by zero. Defaults to 1e-9.
+
+    Returns:
+        Normalized tensor of shape (N, dims).
+    """
+    return x / x.norm(p=2, dim=-1).clamp(min=eps, max=None).unsqueeze(-1)
+
+
+# @torch.jit.script  # Cannot use with multiprocessing (PickleError)
+def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
+    """Convert rotations given as quaternions to rotation matrices.
+
+    Args:
+        quaternions: The quaternion orientation in (w, x, y, z). Shape is (..., 4).
+
+    Returns:
+        Rotation matrices. The shape is (..., 3, 3).
+
+    Reference:
+        https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/transforms/rotation_conversions.py#L41-L70
+    """
+    r, i, j, k = torch.unbind(quaternions, -1)
+    # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
+    two_s = 2.0 / (quaternions * quaternions).sum(-1)
+
+    o = torch.stack(
+        (
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ),
+        -1,
     )
+    return o.reshape(quaternions.shape[:-1] + (3, 3))
 
-    q = r / norm[:, None]
 
-    R = torch.zeros((q.size(0), 3, 3), device="cuda")
-
-    r = q[:, 0]
-    x = q[:, 1]
-    y = q[:, 2]
-    z = q[:, 3]
-
-    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
-    R[:, 0, 1] = 2 * (x * y - r * z)
-    R[:, 0, 2] = 2 * (x * z + r * y)
-    R[:, 1, 0] = 2 * (x * y + r * z)
-    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
-    R[:, 1, 2] = 2 * (y * z - r * x)
-    R[:, 2, 0] = 2 * (x * z - r * y)
-    R[:, 2, 1] = 2 * (y * z + r * x)
-    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+def build_rotation(r):
+    """ Quaternion to rotation matrix """
+    R = matrix_from_quat(r)
     return R
 
 
+# def build_scaling_rotation(s, r):
+#     """ Build Covariance matrix from scaling and rotation """
+#     # formula (6): Sigma = RS S^T R^T
+#     S = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
+#     R = build_rotation(r)
+
+#     S[:, 0, 0] = s[:, 0]
+#     S[:, 1, 1] = s[:, 1]
+#     S[:, 2, 2] = s[:, 2]
+
+#     return R @ S
+
 def build_scaling_rotation(s, r):
-    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
+    """ Build Covariance matrix from scaling and rotation """
+    # formula (6): Sigma = RS S^T R^T
+    # return RS
     R = build_rotation(r)
 
-    L[:, 0, 0] = s[:, 0]
-    L[:, 1, 1] = s[:, 1]
-    L[:, 2, 2] = s[:, 2]
-
-    L = R @ L
-    return L
+    return R * s[:, None, :]
 
 
 def safe_state(silent):

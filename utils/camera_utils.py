@@ -5,7 +5,9 @@ from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 from utils.slam_utils import image_gradient, image_gradient_mask
 import torch.nn.functional as F
 
+
 class Camera(nn.Module):
+    """ Camera Model Class """
     def __init__(
         self,
         uid,
@@ -27,13 +29,16 @@ class Camera(nn.Module):
         self.uid = uid
         self.device = device
 
+        # camera init pose and ground truth pose (transforms from world to camera)
         self.T = torch.eye(4, device=device).to(torch.float32)
         self.T_gt = gt_T.to(device=device).to(torch.float32).clone()
         
+        # input info
         self.original_image = color
         self.depth = depth
         self.grad_mask = None
 
+        # camera intrinsics
         self.fx = fx
         self.fy = fy
         self.cx = cx
@@ -43,6 +48,7 @@ class Camera(nn.Module):
         self.image_height = image_height
         self.image_width = image_width
 
+        # camera pose deltas
         self.cam_rot_delta = nn.Parameter(
             torch.zeros(3, requires_grad=True, device=device)
         )
@@ -50,6 +56,8 @@ class Camera(nn.Module):
             torch.zeros(3, requires_grad=True, device=device)
         )
 
+        # exposure parameters
+        # a and b for exposure compensation: I_corrected = I * exp(a) + b
         self.exposure_a = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=device)
         )
@@ -57,15 +65,13 @@ class Camera(nn.Module):
             torch.tensor([0.0], requires_grad=True, device=device)
         )
 
+        # projection matrix (camera frame to NDC frame)
         self.projection_matrix = projection_matrix.to(device=device)
         
-        
-
-
-
 
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
+        """ Initialize Camera from dataset """
         gt_color, gt_depth, gt_pose = dataset[idx]
         return Camera(
             idx,
@@ -86,6 +92,7 @@ class Camera(nn.Module):
 
     @staticmethod
     def init_from_gui(uid, T, FoVx, FoVy, fx, fy, cx, cy, H, W):
+        """ Initialize Camera from GUI """
         projection_matrix = getProjectionMatrix2(
             znear=0.01, zfar=100.0, fx=fx, fy=fy, cx=cx, cy=cy, W=W, H=H
         ).transpose(0, 1)
@@ -99,6 +106,7 @@ class Camera(nn.Module):
 
     @property
     def full_proj_transform(self):
+        """ Projection Matrix from world to NDC """
         return (
             self.world_view_transform.unsqueeze(0).bmm(
                 self.projection_matrix.unsqueeze(0)
@@ -110,6 +118,7 @@ class Camera(nn.Module):
         return self.world_view_transform #TODO: Need to invert for high order SHs by inverse_t(self.world_view_transform).
         
     def compute_grad_mask(self, config):
+        """ Compute gradient mask and rgb pixel mask """
         edge_threshold = config["Training"]["edge_threshold"]
 
         gray_img = self.original_image.mean(dim=0, keepdim=True)
@@ -136,22 +145,17 @@ class Camera(nn.Module):
             )
 
         gt_image = self.original_image.cuda()
-        _, h, w = self.original_image.cuda().shape
-        mask_shape = (1, h, w)
         rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-        rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-        self.rgb_pixel_mask = rgb_pixel_mask * self.grad_mask
+        rgb_pixel_mask = (gt_image.sum(dim=0, keepdim=True) > rgb_boundary_threshold)
+        self.rgb_pixel_mask = rgb_pixel_mask & self.grad_mask
         self.rgb_pixel_mask_mapping = rgb_pixel_mask
         
         if self.depth is not None:
-            self.gt_depth = torch.from_numpy(self.depth).to(
-            dtype=torch.float32, device=self.device
-        )[None]
+            self.gt_depth = torch.from_numpy(self.depth).to(dtype=torch.float32, device=self.device).unsqueeze(0)
 
-
-        
     
     def clean(self):
+        """ Clean buffer to save memory """
         self.original_image = None
         self.depth = None
         self.grad_mask = None
@@ -166,8 +170,11 @@ class Camera(nn.Module):
         self.rgb_pixel_mask_mapping = None
         self.gt_depth = None
 
+
 class CameraMsg():
-    def __init__(self, Camera):
+    """ Camera Message Class """
+    # save the ID, pose, and ground truth pose 
+    def __init__(self, Camera: Camera):
         self.uid = Camera.uid
         self.T = Camera.T
         self.T_gt = Camera.T_gt

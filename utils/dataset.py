@@ -1,12 +1,12 @@
+import os
 import csv
 import glob
-import os
 
 import cv2
-import numpy as np
+import lycon
 import torch
 import trimesh
-import lycon
+import numpy as np
 
 
 from gaussian_splatting.utils.graphics_utils import focal2fov
@@ -52,11 +52,15 @@ class TUMParser:
         self.load_poses(self.input_folder, frame_rate=32)
         self.n_img = len(self.color_paths)
 
+
     def parse_list(self, filepath, skiprows=0):
         data = np.loadtxt(filepath, delimiter=" ", dtype=np.unicode_, skiprows=skiprows)
         return data
 
+
     def associate_frames(self, tstamp_image, tstamp_depth, tstamp_pose, max_dt=0.08):
+        """ associate frames by timestamp """
+        # image, depth, pose are at different timestamps
         associations = []
         for i, t in enumerate(tstamp_image):
             if tstamp_pose is None:
@@ -65,9 +69,11 @@ class TUMParser:
                     associations.append((i, j))
 
             else:
+                # find the closest depth and pose timestamps
                 j = np.argmin(np.abs(tstamp_depth - t))
                 k = np.argmin(np.abs(tstamp_pose - t))
 
+                # if timestamps are close enough, associate them
                 if (np.abs(tstamp_depth[j] - t) < max_dt) and (
                     np.abs(tstamp_pose[k] - t) < max_dt
                 ):
@@ -75,7 +81,9 @@ class TUMParser:
 
         return associations
 
+
     def load_poses(self, datapath, frame_rate=-1):
+        """ Load data from dataset """
         if os.path.isfile(os.path.join(datapath, "groundtruth.txt")):
             pose_list = os.path.join(datapath, "groundtruth.txt")
         elif os.path.isfile(os.path.join(datapath, "pose.txt")):
@@ -89,30 +97,35 @@ class TUMParser:
         pose_data = self.parse_list(pose_list, skiprows=1)
         pose_vecs = pose_data[:, 0:].astype(np.float64)
 
+        # get timestamps
         tstamp_image = image_data[:, 0].astype(np.float64)
         tstamp_depth = depth_data[:, 0].astype(np.float64)
         tstamp_pose = pose_data[:, 0].astype(np.float64)
         associations = self.associate_frames(tstamp_image, tstamp_depth, tstamp_pose)
 
+        # subsample frames such that two consecutive frames are at least 1/frame_rate seconds apart
         indicies = [0]
+        min_dt = 1.0 / frame_rate
         for i in range(1, len(associations)):
             t0 = tstamp_image[associations[indicies[-1]][0]]
             t1 = tstamp_image[associations[i][0]]
-            if t1 - t0 > 1.0 / frame_rate:
+            if t1 - t0 > min_dt:
                 indicies += [i]
 
+        # create lists and save data for color paths, poses, depth paths, and frames
         self.color_paths, self.poses, self.depth_paths, self.frames = [], [], [], []
-
         for ix in indicies:
             (i, j, k) = associations[ix]
+            # get color and depth paths
             self.color_paths += [os.path.join(datapath, image_data[i, 1])]
             self.depth_paths += [os.path.join(datapath, depth_data[j, 1])]
 
+            # get poses
             quat = pose_vecs[k][4:]
             trans = pose_vecs[k][1:4]
             T = trimesh.transformations.quaternion_matrix(np.roll(quat, 1))
             T[:3, 3] = trans
-            self.poses += [np.linalg.inv(T)]
+            self.poses += [np.linalg.inv(T)] # C2W => W2C
 
             frame = {
                 "file_path": str(os.path.join(datapath, image_data[i, 1])),
@@ -198,6 +211,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.device = "cuda:0"
         self.dtype = torch.float32
         self.num_imgs = 999999
+        # buffer
+        self.color_paths = None
+        self.poses = None
+        self.depth_paths = None
 
     def __len__(self):
         return self.num_imgs
@@ -224,6 +241,7 @@ class MonocularDataset(BaseDataset):
         )
         # distortion parameters
         self.disorted = calibration["distorted"]
+        # radial distortion k1, k2, k3 and tangential distortion p1, p2
         self.dist_coeffs = np.array(
             [
                 calibration["k1"],
@@ -253,7 +271,8 @@ class MonocularDataset(BaseDataset):
                 "translation": np.zeros(3),
             },
         }
-
+        
+        
     def __getitem__(self, idx):
         color_path = self.color_paths[idx]
         pose = self.poses[idx]
@@ -267,15 +286,15 @@ class MonocularDataset(BaseDataset):
             depth_path = self.depth_paths[idx]
             depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH) / self.depth_scale
             
-
-
         image = (
             torch.from_numpy(image / 255.0)
             .clamp(0.0, 1.0)
             .permute(2, 0, 1)
             .to(device=self.device, dtype=self.dtype)
         )
+
         pose = torch.from_numpy(pose).to(device=self.device)
+        
         return image, depth, pose
 
 
@@ -376,11 +395,9 @@ class StereoDataset(BaseDataset):
             image_r = cv2.remap(image_r, self.map1x_r, self.map1y_r, cv2.INTER_LINEAR)
         stereo = cv2.StereoSGBM_create(minDisparity=0, numDisparities=64, blockSize=20)
         stereo.setUniquenessRatio(40)
-        disparity = stereo.compute(image, image_r) / 16.0
+        disparity = stereo.compute(image, image_r) * (1.0 / 16.0)  # Multiply faster than divide
         disparity[disparity == 0] = 1e10
-        depth = 47.90639384423901 / (
-            disparity
-        )  ## Following ORB-SLAM2 config, baseline*fx
+        depth = 47.90639384423901 / disparity  ## Following ORB-SLAM2 config, baseline*fx
         depth[depth < 0] = 0
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         image = (
@@ -448,10 +465,6 @@ class RealsenseDataset(BaseDataset):
         )
 
         self.rgb_intrinsics = self.rgb_profile.get_intrinsics()
-
-
-        
-        
         self.fx = self.rgb_intrinsics.fx
         self.fy = self.rgb_intrinsics.fy
         self.cx = self.rgb_intrinsics.ppx
@@ -491,8 +504,7 @@ class RealsenseDataset(BaseDataset):
 
         frameset = self.pipeline.wait_for_frames()
         aligned_frames = self.align.process(frameset)
-        self.num_frames = self.num_frames + 1
-
+        self.num_frames += 1  # Use += instead of self.num_frames = self.num_frames + 1
 
         rgb_frame = aligned_frames.get_color_frame()
         image = np.asanyarray(rgb_frame.get_data())
@@ -500,6 +512,7 @@ class RealsenseDataset(BaseDataset):
         if self.disorted:
             image = cv2.remap(image, self.map1x, self.map1y, cv2.INTER_LINEAR)
 
+        # More efficient: convert to tensor, divide, clamp, permute in one chain
         image = (
             torch.from_numpy(image / 255.0)
             .clamp(0.0, 1.0)
@@ -510,11 +523,12 @@ class RealsenseDataset(BaseDataset):
         depth = None
         if self.has_depth:
             aligned_depth_frame = aligned_frames.get_depth_frame()
-            depth = np.array(aligned_depth_frame.get_data())*self.depth_scale
+            depth = np.asanyarray(aligned_depth_frame.get_data()) * self.depth_scale  # asanyarray faster than array
             depth[depth < 0] = 0
-            np.nan_to_num(depth, nan=1000)
+            np.nan_to_num(depth, copy=False, nan=1000.0)  # In-place operation
 
         return image, depth, pose
+
 
 def load_dataset(args, path, config):
     if config["Dataset"]["type"] == "tum":

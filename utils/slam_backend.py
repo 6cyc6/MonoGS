@@ -1,16 +1,18 @@
-import random
 import time
+import random
 
 import torch
 import torch.multiprocessing as mp
-from tqdm import tqdm
+import torch.nn.functional as F
 
-from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.utils.loss_utils import l1_loss, ssim
+from tqdm import tqdm
+from fused_ssim import fused_ssim
 from utils.logging_utils import Log
-from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping
+from utils.multiprocessing_utils import clone_obj
+from gaussian_splatting.gaussian_renderer import render
+from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 
 
 class BackEnd(mp.Process):
@@ -337,10 +339,11 @@ class BackEnd(mp.Process):
             )
 
             gt_image = viewpoint_cam.original_image.cuda()
-            Ll1 = l1_loss(image, gt_image)
+            Ll1 = F.l1_loss(image, gt_image)
             loss = (1.0 - self.opt_params.lambda_dssim) * (
                 Ll1
-            ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
+            )+ self.opt_params.lambda_dssim * (1.0 - fused_ssim(image, gt_image))
+            # ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
             loss.backward()
             with torch.no_grad():
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
