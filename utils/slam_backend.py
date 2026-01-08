@@ -40,22 +40,23 @@ class BackEnd(mp.Process):
         self.keyframe_optimizers = None
 
     def set_hyperparams(self):
+        """ Set Backend Hyperparameters """
         self.save_results = self.config["Results"]["save_results"]
 
         self.init_itr_num = self.config["Training"]["init_itr_num"]
         self.init_gaussian_update = self.config["Training"]["init_gaussian_update"]
         self.init_gaussian_reset = self.config["Training"]["init_gaussian_reset"]
-        self.init_gaussian_th = self.config["Training"]["init_gaussian_th"]
+        self.init_gaussian_th = self.config["Training"]["init_gaussian_th"] # 0.005
         self.init_gaussian_extent = (
             self.cameras_extent * self.config["Training"]["init_gaussian_extent"]
-        )
+        ) # 6.0 * 30.0
         self.mapping_itr_num = self.config["Training"]["mapping_itr_num"]
         self.gaussian_update_every = self.config["Training"]["gaussian_update_every"]
         self.gaussian_update_offset = self.config["Training"]["gaussian_update_offset"]
-        self.gaussian_th = self.config["Training"]["gaussian_th"]
+        self.gaussian_th = self.config["Training"]["gaussian_th"] # 0.7
         self.gaussian_extent = (
             self.cameras_extent * self.config["Training"]["gaussian_extent"]
-        )
+        ) # 6.0
         self.gaussian_reset = self.config["Training"]["gaussian_reset"]
         self.size_threshold = self.config["Training"]["size_threshold"]
         self.window_size = self.config["Training"]["window_size"]
@@ -401,6 +402,7 @@ class BackEnd(mp.Process):
                     self.color_refinement()
                     self.push_to_frontend()
                 elif data[0] == "init":
+                    # initialization
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     depth_map = data[3]

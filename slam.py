@@ -71,6 +71,7 @@ class SLAM:
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
+        # setup frontend and backend
         self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
 
@@ -83,7 +84,7 @@ class SLAM:
         self.frontend.q_vis2main = q_vis2main
         self.frontend.set_hyperparams()
 
-        self.backend.gaussians = self.gaussians
+        self.backend.gaussians = self.gaussians # 3DGS map 
         self.backend.background = self.background
         self.backend.cameras_extent = 6.0
         self.backend.pipeline_params = self.pipeline_params
@@ -104,6 +105,7 @@ class SLAM:
         )
 
         backend_process = mp.Process(target=self.backend.run)
+        # start GUI process 
         if self.use_gui:
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
             gui_process.start()

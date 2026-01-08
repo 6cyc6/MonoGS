@@ -118,6 +118,7 @@ class Camera(nn.Module):
         return self.world_view_transform #TODO: Need to invert for high order SHs by inverse_t(self.world_view_transform).
         
     def compute_grad_mask(self, config):
+        """ Compute gradient mask and rgb pixel mask """
         edge_threshold = config["Training"]["edge_threshold"]
 
         gray_img = self.original_image.mean(dim=0, keepdim=True)
@@ -144,17 +145,13 @@ class Camera(nn.Module):
             )
 
         gt_image = self.original_image.cuda()
-        _, h, w = self.original_image.cuda().shape
-        mask_shape = (1, h, w)
         rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-        rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-        self.rgb_pixel_mask = rgb_pixel_mask * self.grad_mask
+        rgb_pixel_mask = (gt_image.sum(dim=0, keepdim=True) > rgb_boundary_threshold)
+        self.rgb_pixel_mask = rgb_pixel_mask & self.grad_mask
         self.rgb_pixel_mask_mapping = rgb_pixel_mask
         
         if self.depth is not None:
-            self.gt_depth = torch.from_numpy(self.depth).to(
-            dtype=torch.float32, device=self.device
-        )[None]
+            self.gt_depth = torch.from_numpy(self.depth).to(dtype=torch.float32, device=self.device).unsqueeze(0)
 
     
     def clean(self):

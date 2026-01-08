@@ -44,6 +44,7 @@ class FrontEnd(mp.Process):
         
 
     def set_hyperparams(self):
+        """ Set Frontend Hyperparameters """
         self.save_dir = self.config["Results"]["save_dir"]
         self.save_results = self.config["Results"]["save_results"]
         self.save_trj = self.config["Results"]["save_trj"]
@@ -60,6 +61,7 @@ class FrontEnd(mp.Process):
         
         self.use_gui = self.config["Results"]["use_gui"]
         self.constant_velocity_warmup = 200 # TODO: fix hardcoding
+        
         
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
@@ -366,6 +368,7 @@ class FrontEnd(mp.Process):
 
             if self.frontend_queue.empty():
                 if cur_frame_idx >= len(self.dataset):
+                    # reach the end of the dataset, save and exit
                     if self.save_results:
                         eval_ate(
                             self.cameras,
@@ -391,12 +394,14 @@ class FrontEnd(mp.Process):
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.001)
                     continue
-
+                
+                # create viewpoint
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix
                 )
+                # compute gradient mask
                 viewpoint.compute_grad_mask(self.config)
-
+                # store viewpoint
                 self.cameras[cur_frame_idx] = viewpoint
 
                 if self.reset:
