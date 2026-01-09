@@ -1,4 +1,5 @@
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -6,6 +7,7 @@ import torch.multiprocessing as mp
 
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
+from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gui import gui_utils
 from utils.camera_utils import Camera, CameraMsg
 from utils.eval_utils import eval_ate, save_gaussians
@@ -37,13 +39,14 @@ class FrontEnd(mp.Process):
         self.requested_keyframe = 0
         self.use_every_n_frames = 1
 
-        self.gaussians = None
+        self.gaussians: Optional[GaussianModel] = None
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
         
 
     def set_hyperparams(self):
+        """ Set Frontend Hyperparameters """
         self.save_dir = self.config["Results"]["save_dir"]
         self.save_results = self.config["Results"]["save_results"]
         self.save_trj = self.config["Results"]["save_trj"]
@@ -61,12 +64,16 @@ class FrontEnd(mp.Process):
         self.use_gui = self.config["Results"]["use_gui"]
         self.constant_velocity_warmup = 200 # TODO: fix hardcoding
         
+        
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
+        """ Add a new keyframe to the SLAM system """
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
         self.kf_indices.append(cur_frame_idx)
         viewpoint = self.cameras[cur_frame_idx]
         gt_img = viewpoint.original_image.cuda()
-        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
+        valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None] # get valid rgb mask 1, H, W
+
+         # initialize depth map for monocular SLAM
         if self.monocular:
             if depth is None:
                 initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2])
@@ -109,12 +116,20 @@ class FrontEnd(mp.Process):
 
                 initial_depth[~valid_rgb] = 0  # Ignore the invalid rgb pixels
             return initial_depth.cpu().numpy()[0]
-        # use the observed depth
-        initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)
-        initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
-        return initial_depth[0].numpy()
+        
+        # use the observed depth for RGB-D SLAM
+        # initial_depth = torch.from_numpy(viewpoint.depth).unsqueeze(0)
+        # initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
+        # return initial_depth[0].numpy()
+        initial_depth = viewpoint.depth[None, ...]
+        mask = valid_rgb.cpu().numpy().astype(bool)
+        initial_depth[~mask] = 0
+        return initial_depth[0]
+
 
     def initialize(self, cur_frame_idx, viewpoint):
+        """ Initialize the SLAM system """
+        # add the first frame as the keyframe
         self.initialized = not self.monocular
         self.kf_indices = []
         self.iteration_count = 0
@@ -128,13 +143,16 @@ class FrontEnd(mp.Process):
         viewpoint.T = viewpoint.T_gt
 
         self.kf_indices = []
-        depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
+        depth_map = self.add_new_keyframe(cur_frame_idx, init=True) # get the depth map 
+         # send init request to the backend
         self.request_init(cur_frame_idx, viewpoint, depth_map)
         self.reset = False
 
+
     def tracking(self, cur_frame_idx, viewpoint):
-        
+        """ Run tracking for the current frame """
         if self.initialized and cur_frame_idx > self.constant_velocity_warmup and self.monocular:
+            # for monocular SLAM, use constant velocity model to initialize the pose
             prev_prev = self.cameras[cur_frame_idx - self.use_every_n_frames -1 ]
             prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
             
@@ -307,6 +325,7 @@ class FrontEnd(mp.Process):
         return window, removed_frame
 
     def request_keyframe(self, cur_frame_idx, viewpoint, current_window, depthmap):
+        """ A new keyframe is created, send message to backend """
         msg = ["keyframe", cur_frame_idx, viewpoint, current_window, depthmap]
         self.backend_queue.put(msg)
         self.requested_keyframe += 1
@@ -315,10 +334,15 @@ class FrontEnd(mp.Process):
         msg = ["map", cur_frame_idx, viewpoint]
         self.backend_queue.put(msg)
 
+
     def request_init(self, cur_frame_idx, viewpoint, depth_map):
+        """ Request Init """
+        # send init request to the backend
+        # send also the frame index, viewpoint info. and initial depth map
         msg = ["init", cur_frame_idx, viewpoint, depth_map]
         self.backend_queue.put(msg)
         self.requested_init = True
+
 
     def sync_backend(self, data):
         self.gaussians = data[1]
@@ -335,7 +359,9 @@ class FrontEnd(mp.Process):
             torch.cuda.empty_cache()
 
     def run(self):
+        """ Frontend Process """
         cur_frame_idx = 0
+        # get projection matrix
         projection_matrix = getProjectionMatrix2(
             znear=0.01,
             zfar=100.0,
@@ -364,6 +390,7 @@ class FrontEnd(mp.Process):
 
             if self.frontend_queue.empty():
                 if cur_frame_idx >= len(self.dataset):
+                    # reach the end of the dataset, save and exit
                     if self.save_results:
                         eval_ate(
                             self.cameras,
@@ -389,25 +416,36 @@ class FrontEnd(mp.Process):
                 if not self.initialized and self.requested_keyframe > 0:
                     time.sleep(0.001)
                     continue
-
+                
+                # =================  Preprocess new frame ================ #
+                # create viewpoint
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix
                 )
+                # compute gradient mask
                 viewpoint.compute_grad_mask(self.config)
-
+                # store viewpoint
                 self.cameras[cur_frame_idx] = viewpoint
 
+                # ====================================================================================#
+                # =====================================  Reset ====================================== #
+                # ====================================================================================#
+                # at the beginning or after a reset, initialize the system
                 if self.reset:
-                    self.initialize(cur_frame_idx, viewpoint)
-                    self.current_window.append(cur_frame_idx)
+                    self.initialize(cur_frame_idx, viewpoint) # initialize the first frame
+                    self.current_window.append(cur_frame_idx) # add the first frame 
                     cur_frame_idx += 1
                     continue
-
+                
+                # check if the system is initialized 
+                # for monocular SLAM, we need at least $(self.window_size) keyframes to initialize the map
                 self.initialized = self.initialized or (
                     len(self.current_window) == self.window_size
                 )
 
-                # Tracking
+                # ====================================================================================#
+                # ==================================  Tracking ====================================== #
+                # ====================================================================================#
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
                 current_window_dict = {}
@@ -441,6 +479,7 @@ class FrontEnd(mp.Process):
                 last_keyframe_idx = self.current_window[0]
                 check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
+                # check if the current frame is a keyframe
                 create_kf = self.is_keyframe(
                     cur_frame_idx,
                     last_keyframe_idx,
@@ -485,8 +524,9 @@ class FrontEnd(mp.Process):
                     )
                 else:
                     self.cleanup(cur_frame_idx)
+                    
+                # run ATE evaluation 
                 cur_frame_idx += 1
-
                 if (
                     self.save_results
                     and self.save_trj

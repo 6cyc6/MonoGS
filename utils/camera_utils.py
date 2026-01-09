@@ -119,6 +119,7 @@ class Camera(nn.Module):
         
     def compute_grad_mask(self, config):
         """ Compute gradient mask and rgb pixel mask """
+        # Use Scharr filter to extract edge pixels for tracking
         edge_threshold = config["Training"]["edge_threshold"]
 
         gray_img = self.original_image.mean(dim=0, keepdim=True)
@@ -149,6 +150,50 @@ class Camera(nn.Module):
         rgb_pixel_mask = (gt_image.sum(dim=0, keepdim=True) > rgb_boundary_threshold)
         self.rgb_pixel_mask = rgb_pixel_mask & self.grad_mask
         self.rgb_pixel_mask_mapping = rgb_pixel_mask
+        
+        # Visualize grad_mask (optional, enable for debugging)
+        if config.get("visualize_grad_mask", False):
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            
+            # Original image
+            axes[0, 0].imshow(self.original_image.cpu().permute(1, 2, 0))
+            axes[0, 0].set_title("Original RGB")
+            axes[0, 0].axis('off')
+            
+            # Grayscale
+            axes[0, 1].imshow(gray_img.squeeze().cpu(), cmap='gray')
+            axes[0, 1].set_title("Grayscale")
+            axes[0, 1].axis('off')
+            
+            # Gradient intensity
+            im = axes[0, 2].imshow(img_grad_intensity.squeeze().cpu(), cmap='hot')
+            axes[0, 2].set_title(f"Gradient Intensity\nMedian={img_grad_intensity.median():.4f}")
+            axes[0, 2].axis('off')
+            
+            # RGB boundary mask
+            axes[1, 0].imshow(rgb_pixel_mask.squeeze().cpu(), cmap='gray')
+            pct1 = rgb_pixel_mask.float().mean().item() * 100
+            axes[1, 0].set_title(f"RGB Boundary Mask\n{pct1:.1f}% pixels")
+            axes[1, 0].axis('off')
+            
+            # Gradient mask
+            axes[1, 1].imshow(self.grad_mask.squeeze().cpu(), cmap='gray')
+            pct2 = self.grad_mask.float().mean().item() * 100
+            axes[1, 1].set_title(f"Gradient Mask\n{pct2:.1f}% pixels (edges)")
+            axes[1, 1].axis('off')
+            
+            # Final tracking mask
+            axes[1, 2].imshow(self.rgb_pixel_mask.squeeze().cpu(), cmap='gray')
+            pct3 = self.rgb_pixel_mask.float().mean().item() * 100
+            axes[1, 2].set_title(f"Tracking Mask (AND)\n{pct3:.1f}% pixels", color='red', weight='bold')
+            axes[1, 2].axis('off')
+            
+            plt.suptitle(f"Grad Mask - Frame {self.uid}\nEdge Threshold: {edge_threshold}", fontsize=14)
+            plt.tight_layout()
+            plt.savefig(f"grad_mask_frame_{self.uid:04d}.png", dpi=100, bbox_inches='tight')
+            plt.close()
+            print(f"Saved grad_mask_frame_{self.uid:04d}.png - Tracking uses {pct3:.1f}% pixels (edges only)")
         
         if self.depth is not None:
             self.gt_depth = torch.from_numpy(self.depth).to(dtype=torch.float32, device=self.device).unsqueeze(0)

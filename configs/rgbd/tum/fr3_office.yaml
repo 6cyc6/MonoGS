@@ -1,5 +1,7 @@
 inherit_from: "configs/rgbd/tum/base_config.yaml"
 
+visualize_grad_mask: False
+
 Dataset:
   dataset_path: "datasets/tum/rgbd_dataset_freiburg3_long_office_household"
   Calibration:

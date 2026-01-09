@@ -1,5 +1,6 @@
 import time
 import random
+from typing import Optional
 
 import torch
 import torch.multiprocessing as mp
@@ -13,13 +14,16 @@ from utils.slam_utils import get_loss_mapping
 from utils.multiprocessing_utils import clone_obj
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
+from gaussian_splatting.scene.gaussian_model import GaussianModel
 
 
 class BackEnd(mp.Process):
+    """ The SLAM Backend process """
+    # maintain the 3DGS map
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.gaussians = None
+        self.gaussians: Optional[GaussianModel] = None
         self.pipeline_params = None
         self.opt_params = None
         self.background = None
@@ -39,8 +43,10 @@ class BackEnd(mp.Process):
         self.current_window = []
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
+        
 
     def set_hyperparams(self):
+        """ Set Backend Hyperparameters """
         self.save_results = self.config["Results"]["save_results"]
 
         self.init_itr_num = self.config["Training"]["init_itr_num"]
@@ -66,12 +72,19 @@ class BackEnd(mp.Process):
             else False
         )
 
+
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
+        """ Add next keyframe to the map """
         self.gaussians.extend_from_pcd_seq(
-            viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
+            viewpoint, 
+            kf_id=frame_idx, 
+            init=init, 
+            scale=scale, 
+            depthmap=depth_map
         )
 
     def reset(self):
+        """ Reset the backend system """
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.viewpoints = {}
@@ -398,13 +411,15 @@ class BackEnd(mp.Process):
                     self.color_refinement()
                     self.push_to_frontend()
                 elif data[0] == "init":
+                    # recieve init request from the frontend
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     depth_map = data[3]
                     Log("Resetting the system")
-                    self.reset()
-
-                    self.viewpoints[cur_frame_idx] = viewpoint
+                    self.reset() # reset the backend system
+                    
+                    # after reset, viewpoints is an empty dict
+                    self.viewpoints[cur_frame_idx] = viewpoint # add the current viewpoint to the dict buffer
                     self.add_next_kf(
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
                     )

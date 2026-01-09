@@ -33,31 +33,37 @@ from gaussian_splatting.utils.system_utils import mkdir_p
 
 class GaussianModel:
     def __init__(self, sh_degree: int, config=None):
+        # SH degree for color representation
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
 
-        self._xyz = torch.empty(0, device="cuda")
-        self._features_dc = torch.empty(0, device="cuda")
-        self._features_rest = torch.empty(0, device="cuda")
-        self._scaling = torch.empty(0, device="cuda")
-        self._rotation = torch.empty(0, device="cuda")
-        self._opacity = torch.empty(0, device="cuda")
-        self.max_radii2D = torch.empty(0, device="cuda")
-        self.xyz_gradient_accum = torch.empty(0, device="cuda")
+        # 3DGS parameters
+        self._xyz = torch.empty(0, device="cuda") # means (N, 3)
+        self._features_dc = torch.empty(0, device="cuda") # SH coefficients for DC color
+        self._features_rest = torch.empty(0, device="cuda") # rest SH coefficients 
+        self._scaling = torch.empty(0, device="cuda") # scaling (N, 3)
+        self._rotation = torch.empty(0, device="cuda") # rotation (N, 4) # quaternion
+        self._opacity = torch.empty(0, device="cuda") # opacity (N, 1)
+        self.max_radii2D = torch.empty(0, device="cuda") # maximum projected 2D radius 
+        self.xyz_gradient_accum = torch.empty(0, device="cuda") # gradient accumulator for xyz
 
-        self.unique_kfIDs = torch.empty(0).int()
-        self.n_obs = torch.empty(0).int()
+        self.unique_kfIDs = torch.empty(0).int() # unique keyframe IDs
+        self.n_obs = torch.empty(0).int() # number of observations
 
         self.optimizer = None
 
+        # scale takes log values
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
+        # covariance built from scaling and rotation (scale in R^3, rotation in quaternion R^4 -> Cov. Mat. -> 6-vector)
         self.covariance_activation = self.build_covariance_from_scaling_rotation
 
+        # opacity takes logits (between 0 and 1)
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
 
+        # rotation normalized quaternion (N, 4)
         self.rotation_activation = torch.nn.functional.normalize
 
         self.config = config
@@ -65,14 +71,19 @@ class GaussianModel:
 
         self.isotropic = False
 
+
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
     ):
+        """ Build covariance matrix from scaling and rotation parameters """
+        # formula (6): Sigma = RS S^T R^T = L L^T
+        # symm saves 6 independent entries of Sigma
         L = build_scaling_rotation(scaling_modifier * scaling, rotation)
         actual_covariance = L @ L.transpose(1, 2)
         symm = strip_symmetric(actual_covariance)
         return symm
 
+    # =================== Get 3DGS Properties =================== #
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -101,10 +112,19 @@ class GaussianModel:
         )
 
     def oneupSHdegree(self):
+        """ Increase active SH degree by one """
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    
+    def init_lr(self, spatial_lr_scale):
+        """ Initialize learning rate """
+        self.spatial_lr_scale = spatial_lr_scale # for position, scaling
+        
+        
+    # ======================= Functions for adding new 3DGS from RGBD ======================= #
     def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None):
+        """ Create point cloud from image and depth map """
         cam = cam_info
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
@@ -130,15 +150,21 @@ class GaussianModel:
 
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
 
+
     def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
+        """ Create point cloud from image and depth map """
+        # for initialization, we downsample less, use more points
         if init:
             downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
         else:
             downsample_factor = self.config["Dataset"]["pcd_downsample"]
+        # point size of the Gaussians
         point_size = self.config["Dataset"]["point_size"]
         if "adaptive_pointsize" in self.config["Dataset"]:
             if self.config["Dataset"]["adaptive_pointsize"]:
                 point_size = min(0.05, point_size * np.median(depth))
+        
+        # get the rgbd image
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             rgb,
             depth,
@@ -147,8 +173,8 @@ class GaussianModel:
             convert_rgb_to_intensity=False,
         )
 
-        W2C = cam.T.cpu().numpy()
-
+        # get the camera extrinsics and extract the point cloud
+        W2C = cam.T.cpu().numpy() # cam.T is world to camera (inverse of wTc, wTc: camera pose in the world frame)
         pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd,
             o3d.camera.PinholeCameraIntrinsic(
@@ -162,25 +188,29 @@ class GaussianModel:
             extrinsic=W2C,
             project_valid_depth_only=True,
         )
+        # downsample the point cloud and convert to numpy
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
 
+        # save the point cloud for visualization
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
         )
         self.ply_input = pcd
 
-        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())
-        features = (
-            torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
-            .float()
-            .cuda()
-        )
-        features[:, :3, 0] = fused_color
-        features[:, 3:, 1:] = 0.0
+        # fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()
+        # fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())
+        fused_point_cloud = torch.from_numpy(new_xyz).float().cuda()
+        fused_color = RGB2SH(torch.from_numpy(new_rgb).float().cuda()) # RGB to SH (direct coefficient only)
+        
+        # create features with DC and rest SH coeffs
+        # for each RGB channel, we have 1 DC + rest SH coeffs
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color # set the DC coeffs
+        features[:, 3:, 1:] = 0.0 # rest SH coeffs set to 0
 
+        # run KNN to determine scale
         dist2 = (
             torch.clamp_min(
                 distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
@@ -190,10 +220,13 @@ class GaussianModel:
         )
         scales = torch.log(torch.sqrt(dist2))[..., None]
         if not self.isotropic:
+            # set each Gaussian to be spherical
             scales = scales.repeat(1, 3)
 
+        # initialize rotation to identity
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
+        # initialize opacity to 0.5
         opacities = inverse_sigmoid(
             0.5
             * torch.ones(
@@ -203,25 +236,25 @@ class GaussianModel:
 
         return fused_point_cloud, features, scales, rots, opacities
 
-    def init_lr(self, spatial_lr_scale):
-        self.spatial_lr_scale = spatial_lr_scale
 
     def extend_from_pcd(
         self, fused_point_cloud, features, scales, rots, opacities, kf_id
     ):
+        """ Extend the 3DGS with those extracted from the point cloud """
         new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         new_features_dc = nn.Parameter(
             features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
-        )
+        ) # N,1,3
         new_features_rest = nn.Parameter(
             features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
-        )
-        new_scaling = nn.Parameter(scales.requires_grad_(True))
-        new_rotation = nn.Parameter(rots.requires_grad_(True))
-        new_opacity = nn.Parameter(opacities.requires_grad_(True))
+        ) # N,F-1,3 (N,0,3)
+        new_scaling = nn.Parameter(scales.requires_grad_(True)) # N,3
+        new_rotation = nn.Parameter(rots.requires_grad_(True)) # N, 4
+        new_opacity = nn.Parameter(opacities.requires_grad_(True)) # N, 1
 
-        new_unique_kfIDs = torch.ones((new_xyz.shape[0])).int() * kf_id
-        new_n_obs = torch.zeros((new_xyz.shape[0])).int()
+        new_unique_kfIDs = torch.ones((new_xyz.shape[0])).int() * kf_id # N,
+        new_n_obs = torch.zeros((new_xyz.shape[0])).int() # N, 
+        # post process
         self.densification_postfix(
             new_xyz,
             new_features_dc,
@@ -233,16 +266,21 @@ class GaussianModel:
             new_n_obs=new_n_obs,
         )
 
+
     def extend_from_pcd_seq(
         self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None
     ):
+        """ Extend the 3DGS with point cloud from the keyframe """
+        # create point cloud from image and depth
         fused_point_cloud, features, scales, rots, opacities = (
             self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap)
         )
+        # extend the model with the gaussians from the point cloud
         self.extend_from_pcd(
             fused_point_cloud, features, scales, rots, opacities, kf_id
         )
 
+    # ======================= Optimization Setup ======================= #
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -521,7 +559,9 @@ class GaussianModel:
         self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
 
+
     def cat_tensors_to_optimizer(self, tensors_dict):
+        """ Append new tensors to the optimizer parameters """
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
@@ -555,6 +595,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
+
     def densification_postfix(
         self,
         new_xyz,
@@ -566,6 +607,7 @@ class GaussianModel:
         new_kf_ids=None,
         new_n_obs=None,
     ):
+        """ Post-processing after densification """
         d = {
             "xyz": new_xyz,
             "f_dc": new_features_dc,
@@ -590,6 +632,7 @@ class GaussianModel:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
         if new_n_obs is not None:
             self.n_obs = torch.cat((self.n_obs, new_n_obs)).int()
+
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

@@ -1,8 +1,8 @@
 import os
 import sys
 import time
-from argparse import ArgumentParser
 from datetime import datetime
+from argparse import ArgumentParser
 
 import torch
 import torch.multiprocessing as mp
@@ -10,24 +10,25 @@ import yaml
 from munch import munchify
 
 import wandb
-from gaussian_splatting.scene.gaussian_model import GaussianModel
-from gaussian_splatting.utils.system_utils import mkdir_p
 from gui import gui_utils, slam_gui
-from utils.config_utils import load_config
+from gaussian_splatting.utils.system_utils import mkdir_p
+from gaussian_splatting.scene.gaussian_model import GaussianModel
 from utils.dataset import load_dataset
+from utils.config_utils import load_config
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
-from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
+from utils.multiprocessing_utils import FakeQueue
 
 
 class SLAM:
     def __init__(self, config, save_dir=None):
+        # create CUDA events for timing
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-
+        # load configuration
         self.config = config
         self.save_dir = save_dir
         model_params = munchify(config["model_params"])
@@ -47,18 +48,20 @@ class SLAM:
             self.use_gui = True
         self.eval_rendering = self.config["Results"]["eval_rendering"]
 
+        # 3DGS setup
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
 
         self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
         self.gaussians.init_lr(6.0)
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
-        )
+        ) # load dataset
 
         self.gaussians.training_setup(opt_params)
         bg_color = [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        # setup multiprocessing queues for SLAM 
         frontend_queue = mp.Queue()
         backend_queue = mp.Queue()
 
@@ -68,6 +71,7 @@ class SLAM:
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
+        # setup frontend and backend
         self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
 
@@ -91,6 +95,7 @@ class SLAM:
 
         self.backend.set_hyperparams()
 
+        # setup GUI 
         self.params_gui = gui_utils.ParamsGUI(
             pipe=self.pipeline_params,
             background=self.background,
@@ -100,24 +105,29 @@ class SLAM:
         )
 
         backend_process = mp.Process(target=self.backend.run)
+        # start GUI process 
         if self.use_gui:
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
             gui_process.start()
             time.sleep(5)
 
+        # start timing and SLAM processes
         start.record()
         backend_process.start()
         self.frontend.run()
         backend_queue.put(["pause"])
 
+        # stop timing
         end.record()
         torch.cuda.synchronize()
         # empty the frontend queue
         N_frames = len(self.frontend.cameras)
+        # show timing results
         FPS = N_frames / (start.elapsed_time(end) * 0.001)
         Log("Total time", start.elapsed_time(end) * 0.001, tag="Eval")
         Log("Total FPS", N_frames / (start.elapsed_time(end) * 0.001), tag="Eval")
 
+        # evaluate rendering 
         if self.eval_rendering:
             self.gaussians = self.frontend.gaussians
             kf_indices = self.frontend.kf_indices
