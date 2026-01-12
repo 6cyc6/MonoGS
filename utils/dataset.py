@@ -17,15 +17,62 @@ except Exception:
     pass
 
 
+class CustomParser:
+    def __init__(self, input_folder):
+        # color and depth images are matched, directly load them
+        # load color and depth paths, poses, and frames
+        self.input_folder = input_folder
+        self.color_paths = sorted(glob.glob(f"{self.input_folder}/rgb/*.png"))
+        self.depth_paths = sorted(glob.glob(f"{self.input_folder}/depth/*.png"))
+        self.mask_paths = sorted(glob.glob(f"{self.input_folder}/mask/*.png"))
+        self.n_img = len(self.color_paths)
+        self.load_poses(f"{self.input_folder}")
+
+
+    def load_poses(self, dataset_path):
+        """
+        Load object poses and camera config, transform to camera-moving coordinate frame.
+        
+        Transformation logic:
+        - Original: Fixed camera observing moving object
+        - Target: Moving camera observing fixed object
+        - T_world_to_camera_new = T_world_to_object * T_world_to_camera_fixed
+        """
+        self.poses = []
+        # Load object poses (N, 7) - [tx, ty, tz, qw, qx, qy, qz] format from Isaac Lab
+        gt_data = torch.load(os.path.join(dataset_path, "camera_poses.pt"))
+        pos = gt_data['pos'].numpy()  # (N, 3)
+        quat = gt_data['quat'].numpy()  # (N, 4) in (qw, qx, qy, qz) format
+        
+        frames = []
+        for i in range(len(pos)):
+            # T = trimesh.transformations.quaternion_matrix(np.roll(quat, 1))
+            T = trimesh.transformations.quaternion_matrix(quat[i])
+            T[:3, 3] = pos[i]
+            pose = np.linalg.inv(T)  # C2W => W2C
+            self.poses += [pose]
+            frame = {
+                "file_path": self.color_paths[i],
+                "depth_path": self.depth_paths[i],
+                "transform_matrix": pose.tolist(),
+            }
+        self.frames = frames
+
+
 class ReplicaParser:
     def __init__(self, input_folder):
+        # color and depth images are matched, directly load them
+        # load color and depth paths, poses, and frames
         self.input_folder = input_folder
         self.color_paths = sorted(glob.glob(f"{self.input_folder}/results/frame*.jpg"))
         self.depth_paths = sorted(glob.glob(f"{self.input_folder}/results/depth*.png"))
         self.n_img = len(self.color_paths)
         self.load_poses(f"{self.input_folder}/traj.txt")
 
+
     def load_poses(self, path):
+        """ Load poses from traj.txt """
+        # save poses and frames
         self.poses = []
         with open(path, "r") as f:
             lines = f.readlines()
@@ -48,6 +95,8 @@ class ReplicaParser:
 
 class TUMParser:
     def __init__(self, input_folder):
+        # rgb images, depth images, and poses are at different timestamps, need to associate them
+        # load color and depth paths, poses, and frames
         self.input_folder = input_folder
         self.load_poses(self.input_folder, frame_rate=32)
         self.n_img = len(self.color_paths)
@@ -465,76 +514,11 @@ class CustomDataset(MonocularDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         dataset_path = config["Dataset"]["dataset_path"]
-        
-        # Load RGB, depth, mask paths
-        self.color_paths = sorted(glob.glob(f"{dataset_path}/rgb/*.png"))
-        self.depth_paths = sorted(glob.glob(f"{dataset_path}/depth/*.png"))
-        self.mask_paths = sorted(glob.glob(f"{dataset_path}/mask/*.png"))
-        
-        self.num_imgs = len(self.color_paths)
-        
-        # Validate that we have matching files
-        assert len(self.color_paths) == len(self.depth_paths) == len(self.mask_paths), \
-            f"Mismatch: {len(self.color_paths)} RGB, {len(self.depth_paths)} depth, {len(self.mask_paths)} masks"
-        
-        # Load object poses and camera config, then transform
-        self._load_poses(dataset_path)
-    
-        
-    def _load_poses(self, dataset_path):
-        """
-        Load object poses and camera config, transform to camera-moving coordinate frame.
-        
-        Transformation logic:
-        - Original: Fixed camera observing moving object
-        - Target: Moving camera observing fixed object
-        - T_world_to_camera_new = T_world_to_object * T_world_to_camera_fixed
-        """
-        self.poses = []
-        # Load object poses (N, 7) - [tx, ty, tz, qw, qx, qy, qz] format from Isaac Lab
-        gt_data = torch.load(os.path.join(dataset_path, "camera_poses.pt"))
-        pos = gt_data['pos'].numpy()  # (N, 3)
-        quat = gt_data['quat'].numpy()  # (N, 4) in (qw, qx, qy, qz) format
-        
-        for i in range(len(pos)):
-            # T = trimesh.transformations.quaternion_matrix(np.roll(quat, 1))
-            T = trimesh.transformations.quaternion_matrix(quat[i])
-            T[:3, 3] = pos[i]
-            self.poses += [np.linalg.inv(T)] # C2W => W2C
-
-    
-    def __getitem__(self, idx):
-        color_path = self.color_paths[idx]
-        depth_path = self.depth_paths[idx]
-        mask_path = self.mask_paths[idx]
-        pose = self.poses[idx]
-        
-        # Load RGB
-        image = lycon.load(color_path)
-        
-        # Load depth
-        depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH) / self.depth_scale
-        
-        # load mask
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        mask_bool = mask > 127  # binary mask
-        mask = torch.from_numpy(mask_bool.astype(np.uint8)).to(device=self.device)
-        
-        # Apply undistortion if needed
-        if self.disorted:
-            image = cv2.remap(image, self.map1x, self.map1y, cv2.INTER_LINEAR)
-            depth = cv2.remap(depth, self.map1x, self.map1y, cv2.INTER_NEAREST)
-        
-        # Convert to tensors
-        image = (
-            torch.from_numpy(image / 255.0)
-            .clamp(0.0, 1.0)
-            .permute(2, 0, 1)
-            .to(device=self.device, dtype=self.dtype)
-        )
-        pose = torch.from_numpy(pose).to(device=self.device)
-        
-        return image, depth, pose, mask
+        parser = CustomParser(dataset_path)
+        self.num_imgs = parser.n_img
+        self.color_paths = parser.color_paths
+        self.depth_paths = parser.depth_paths
+        self.poses = parser.poses
 
 
 class EurocDataset(StereoDataset):
