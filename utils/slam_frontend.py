@@ -1,10 +1,12 @@
 import time
-from typing import Optional
-
-import numpy as np
 import torch
+import numpy as np
+import open3d as o3d
 import torch.multiprocessing as mp
 
+
+from typing import Optional
+from scipy.spatial.transform import Rotation as R
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 from gaussian_splatting.scene.gaussian_model import GaussianModel
@@ -12,9 +14,11 @@ from gui import gui_utils
 from utils.camera_utils import Camera, CameraMsg
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
-from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_tracking, get_median_depth
+from utils.multiprocessing_utils import clone_obj
+from utils.slam_utils import get_loss_tracking, get_median_depth, points_in_mask, pts_image_to_cam
+from lightglue.lightglue_wrapper import LightGlueWrapper
+
 
 class FrontEnd(mp.Process):
     def __init__(self, config):
@@ -43,6 +47,7 @@ class FrontEnd(mp.Process):
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
+        self.custom = False
         
 
     def set_hyperparams(self):
@@ -64,6 +69,9 @@ class FrontEnd(mp.Process):
         self.use_gui = self.config["Results"]["use_gui"]
         self.constant_velocity_warmup = 200 # TODO: fix hardcoding
         
+        if self.custom:
+            self.lightglue = LightGlueWrapper(feature_type='superpoint', max_num_keypoints=512, device=self.device)
+        
         
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         """ Add a new keyframe to the SLAM system """
@@ -73,7 +81,7 @@ class FrontEnd(mp.Process):
         gt_img = viewpoint.original_image.cuda()
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None] # get valid rgb mask 1, H, W
 
-         # initialize depth map for monocular SLAM
+        # initialize depth map for monocular SLAM
         if self.monocular:
             if depth is None:
                 initial_depth = 2 * torch.ones(1, gt_img.shape[1], gt_img.shape[2])
@@ -148,12 +156,87 @@ class FrontEnd(mp.Process):
         self.request_init(cur_frame_idx, viewpoint, depth_map)
         self.reset = False
 
+    
+    def keypoint_matching(self, cur_frame_idx, prev_frame_idx=None):
+        """ Perform keypoint matching between two viewpoints using LightGlue """
+        # load previous and current viewpoints
+        if prev_frame_idx is None:
+            prev_frame_idx = cur_frame_idx - self.use_every_n_frames
+        prev_viewpoint = self.cameras[prev_frame_idx]
+        cur_viewpoint = self.cameras[cur_frame_idx]
+        
+        # load images, depths and masks
+        # prev_img = prev_viewpoint.original_image.cuda()
+        prev_img = prev_viewpoint.original_image
+        prev_depth = torch.from_numpy(prev_viewpoint.depth.astype(np.float32)).to(device=self.device)
+        prev_mask = prev_viewpoint.mask # (H, W)
+        prev_img_masked = prev_img * prev_mask
+        
+        # cur_img = cur_viewpoint.original_image.cuda()
+        cur_img = cur_viewpoint.original_image
+        cur_depth = torch.from_numpy(cur_viewpoint.depth.astype(np.float32)).to(device=self.device)
+        cur_mask = cur_viewpoint.mask # (H, W)
+        cur_img_masked = cur_img * cur_mask
+        
+        # load camera inv intrinsics
+        prev_K_inv = prev_viewpoint.get_inv_K()
+        cur_K_inv = cur_viewpoint.get_inv_K()
+        
+        # run lightglue matching
+        pts0, pts1, feats0, feats1, matches = self.lightglue.match(prev_img_masked, cur_img_masked, return_feat=True)
+        
+        # check points are in the mask
+        _, pts_mask0 = points_in_mask(pts0, prev_mask)
+        _, pts_mask1 = points_in_mask(pts1, cur_mask)
+        pts_mask = pts_mask0 & pts_mask1
+        pts0_in_mask = pts0[pts_mask, :].int()
+        pts1_in_mask = pts1[pts_mask, :].int()
+
+        # project to camera frame
+        pts_cam_0 = pts_image_to_cam(pts0_in_mask, prev_depth, prev_K_inv)
+        pts_cam_1 = pts_image_to_cam(pts1_in_mask, cur_depth, cur_K_inv)
+        
+        # run MSE alignment
+        pts_cam_0 = pts_cam_0.cpu().numpy()
+        pts_cam_1 = pts_cam_1.cpu().numpy()
+        
+        # Convert numpy arrays to Open3D point clouds
+        pcd_source = o3d.geometry.PointCloud()
+        pcd_target = o3d.geometry.PointCloud()
+        pcd_source.points = o3d.utility.Vector3dVector(pts_cam_0)
+        pcd_target.points = o3d.utility.Vector3dVector(pts_cam_1)
+
+        # Create correspondences (each point matches to itself in the correspondence list)
+        correspondences = np.arange(len(pts_cam_0)).reshape(-1, 1)
+        correspondences = np.hstack([correspondences, correspondences])  # Shape (N, 2)
+        corres_o3d = o3d.utility.Vector2iVector(correspondences)
+
+        # Run RANSAC-based registration
+        result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
+            source=pcd_source,
+            target=pcd_target,
+            corres=corres_o3d,
+            max_correspondence_distance=0.005,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            ransac_n=3,
+            checkers=[
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(0.005)
+            ],
+            criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999)
+        )
+        transformation = result.transformation
+        
+        trans_mat = torch.tensor(transformation, device=self.device, dtype=torch.float32)
+            
+        return trans_mat
+    
 
     def tracking(self, cur_frame_idx, viewpoint):
         """ Run tracking for the current frame """
         if self.initialized and cur_frame_idx > self.constant_velocity_warmup and self.monocular:
             # for monocular SLAM, use constant velocity model to initialize the pose
-            prev_prev = self.cameras[cur_frame_idx - self.use_every_n_frames -1 ]
+            prev_prev = self.cameras[cur_frame_idx - self.use_every_n_frames -1]
             prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
             
             pose_prev_prev = prev_prev.T
@@ -162,8 +245,15 @@ class FrontEnd(mp.Process):
             pose_new = velocity @ pose_prev
             viewpoint.T = pose_new
         else:
-            prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-            viewpoint.T = prev.T
+            # For RGB-D SLAM, initialize from the last frame
+            if self.custom:
+                # Use previous keyframe instead of previous frame
+                prev_kf_idx = self.kf_indices[-1] if len(self.kf_indices) > 0 else 0
+                trans_mat = self.keypoint_matching(cur_frame_idx, prev_kf_idx)
+                viewpoint.T = trans_mat @ self.cameras[prev_kf_idx].T
+            else:
+                prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+                viewpoint.T = prev.T
             
         opt_params = []
         opt_params.append(
@@ -231,6 +321,7 @@ class FrontEnd(mp.Process):
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg
 
+
     def is_keyframe(
         self,
         cur_frame_idx,
@@ -260,6 +351,7 @@ class FrontEnd(mp.Process):
         ).count_nonzero()
         point_ratio_2 = intersection / union
         return (point_ratio_2 < kf_overlap and dist_check2) or dist_check
+
 
     def add_to_window(
         self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
@@ -353,8 +445,23 @@ class FrontEnd(mp.Process):
         for kf_id, kf_T in keyframes:
             self.cameras[kf_id].T = kf_T
 
+
     def cleanup(self, cur_frame_idx):
-        self.cameras[cur_frame_idx].clean()
+        # self.cameras[cur_frame_idx].clean()
+        # Don't clean frames that might be needed for keypoint matching
+        # Keep the previous keyframe for next iteration
+        frames_to_keep = set()
+        if self.custom:
+            # Keep the current frame
+            frames_to_keep.add(cur_frame_idx)
+            # Keep the previous keyframe (will be used for matching in next iteration)
+            if len(self.kf_indices) > 0:
+                frames_to_keep.add(self.kf_indices[-1])
+        
+        # Clean frames that are not needed
+        if cur_frame_idx not in frames_to_keep:
+            self.cameras[cur_frame_idx].clean()
+        
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()
 
@@ -376,12 +483,16 @@ class FrontEnd(mp.Process):
 
 
         while True:
+            # Check for pause signal from GUI
             if self.q_vis2main.empty():
                 if self.pause:
+                    # stay paused
                     continue
             else:
+                # get info from GUI
                 data_vis2main = self.q_vis2main.get()
                 self.pause = data_vis2main.flag_pause
+                # send pause/unpause signal to backend
                 if self.pause:
                     self.backend_queue.put(["pause"])
                     continue
@@ -420,10 +531,15 @@ class FrontEnd(mp.Process):
                 # =================  Preprocess new frame ================ #
                 # create viewpoint
                 viewpoint = Camera.init_from_dataset(
-                    self.dataset, cur_frame_idx, projection_matrix
+                    self.dataset, cur_frame_idx, projection_matrix, custom=self.custom
                 )
                 # compute gradient mask
-                viewpoint.compute_grad_mask(self.config)
+                if self.custom:
+                    viewpoint.rgb_pixel_mask = viewpoint.mask
+                    viewpoint.rgb_pixel_mask_mapping = viewpoint.mask
+                    viewpoint.gt_depth = torch.from_numpy(viewpoint.depth).to(dtype=torch.float32, device=self.device).unsqueeze(0)
+                else:
+                    viewpoint.compute_grad_mask(self.config)
                 # store viewpoint
                 self.cameras[cur_frame_idx] = viewpoint
 

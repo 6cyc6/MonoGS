@@ -43,6 +43,7 @@ class BackEnd(mp.Process):
         self.current_window = []
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
+        self.custom = False
         
 
     def set_hyperparams(self):
@@ -98,7 +99,9 @@ class BackEnd(mp.Process):
         while not self.backend_queue.empty():
             self.backend_queue.get()
 
+
     def initialize_map(self, cur_frame_idx, viewpoint):
+        """ Initialize the 3DGS map """
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
             render_pkg = render(
@@ -122,7 +125,7 @@ class BackEnd(mp.Process):
                 render_pkg["n_touched"],
             )
             loss_init = get_loss_mapping(
-                self.config, image, depth, viewpoint, opacity, initialization=True
+                self.config, image, depth, viewpoint, opacity, initialization=True, custom=self.custom
             )
             loss_init.backward()
 
@@ -150,9 +153,11 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
 
-        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
+        # get the index of visible gaussians
+        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long() # turn to binary tensor 0/1
         Log("Initialized map")
         return render_pkg
+    
 
     def map(self, current_window, prune=False, iters=1):
         if len(current_window) == 0:
@@ -368,7 +373,9 @@ class BackEnd(mp.Process):
                 self.gaussians.update_learning_rate(iteration)
         Log("Map refinement done")
 
+
     def push_to_frontend(self, tag=None):
+        # clear the last sent counter
         self.last_sent = 0
         keyframes = []
         for kf_idx in self.current_window:
@@ -378,12 +385,15 @@ class BackEnd(mp.Process):
         if tag is None:
             tag = "sync_backend"
 
+        # send the updated gaussians, visible gaussians index dict {"frame_idx": binary tensor}, and keyframes (idx, pose) to the frontend
         msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
         self.frontend_queue.put(msg)
+
 
     def run(self):
         while True:
             if self.backend_queue.empty():
+                # check for pause
                 if self.pause:
                     time.sleep(0.01)
                     continue
@@ -394,6 +404,8 @@ class BackEnd(mp.Process):
                 if self.single_thread:
                     time.sleep(0.01)
                     continue
+                
+                # perform mapping
                 self.map(self.current_window)
                 if self.last_sent >= 10:
                     self.map(self.current_window, 
@@ -423,7 +435,9 @@ class BackEnd(mp.Process):
                     self.add_next_kf(
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
                     )
+                    # initialize the map with the first keyframe
                     self.initialize_map(cur_frame_idx, viewpoint)
+                    # send info to frontend
                     self.push_to_frontend("init")
 
                 elif data[0] == "keyframe":

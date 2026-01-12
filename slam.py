@@ -74,6 +74,10 @@ class SLAM:
         # setup frontend and backend
         self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
+        
+        if self.config["Dataset"]["type"] == "custom":
+            self.frontend.custom = True
+            self.backend.custom = True
 
         self.frontend.dataset = self.dataset
         self.frontend.background = self.background

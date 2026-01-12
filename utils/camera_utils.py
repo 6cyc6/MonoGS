@@ -24,6 +24,7 @@ class Camera(nn.Module):
         image_height,
         image_width,
         device="cuda:0",
+        mask=None,
     ):
         super(Camera, self).__init__()
         self.uid = uid
@@ -37,6 +38,7 @@ class Camera(nn.Module):
         self.original_image = color
         self.depth = depth
         self.grad_mask = None
+        self.mask = mask
 
         # camera intrinsics
         self.fx = fx
@@ -70,8 +72,28 @@ class Camera(nn.Module):
         
 
     @staticmethod
-    def init_from_dataset(dataset, idx, projection_matrix):
+    def init_from_dataset(dataset, idx, projection_matrix, custom=False):
         """ Initialize Camera from dataset """
+        if custom:
+            gt_color, gt_depth, gt_pose, gt_mask = dataset[idx]
+            return Camera(
+                idx,
+                gt_color,
+                gt_depth,
+                gt_pose,
+                projection_matrix,
+                dataset.fx,
+                dataset.fy,
+                dataset.cx,
+                dataset.cy,
+                dataset.fovx,
+                dataset.fovy,
+                dataset.height,
+                dataset.width,
+                device=dataset.device,
+                mask=gt_mask,
+            )
+            
         gt_color, gt_depth, gt_pose = dataset[idx]
         return Camera(
             idx,
@@ -116,6 +138,21 @@ class Camera(nn.Module):
     @property
     def camera_center(self):
         return self.world_view_transform #TODO: Need to invert for high order SHs by inverse_t(self.world_view_transform).
+    
+    
+    def get_inv_K(self):
+        """ Get camera intrinsics """
+        intrinsics = torch.tensor(
+            [
+                [self.fx, 0.0, self.cx],
+                [0.0, self.fy, self.cy],
+                [0.0, 0.0, 1.0],
+            ],
+            device=self.device,
+        )
+        
+        return torch.linalg.inv(intrinsics)
+    
         
     def compute_grad_mask(self, config):
         """ Compute gradient mask and rgb pixel mask """

@@ -506,6 +506,7 @@ class CustomDataset(MonocularDataset):
     def __getitem__(self, idx):
         color_path = self.color_paths[idx]
         depth_path = self.depth_paths[idx]
+        mask_path = self.mask_paths[idx]
         pose = self.poses[idx]
         
         # Load RGB
@@ -513,6 +514,11 @@ class CustomDataset(MonocularDataset):
         
         # Load depth
         depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH) / self.depth_scale
+        
+        # load mask
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        mask_bool = mask > 127  # binary mask
+        mask = torch.from_numpy(mask_bool.astype(np.uint8)).to(device=self.device)
         
         # Apply undistortion if needed
         if self.disorted:
@@ -528,7 +534,7 @@ class CustomDataset(MonocularDataset):
         )
         pose = torch.from_numpy(pose).to(device=self.device)
         
-        return image, depth, pose
+        return image, depth, pose, mask
 
 
 class EurocDataset(StereoDataset):

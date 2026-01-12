@@ -1,9 +1,8 @@
 import torch
 
-# TODO: remove unused variables/functions
 
 def image_gradient(image):
-    # Compute image gradient using Scharr Filter
+    """ Compute image gradient using Scharr Filter """
     c = image.shape[0]
     conv_y = torch.tensor(
         [[3, 0, -3], [10, 0, -10], [3, 0, -3]], dtype=torch.float32, device="cuda"
@@ -23,7 +22,7 @@ def image_gradient(image):
 
 
 def image_gradient_mask(image, eps=0.01):
-    # Compute image gradient mask
+    """ Compute image gradient mask """
     c = image.shape[0]
     conv_y = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
     conv_x = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
@@ -81,34 +80,47 @@ def get_loss_tracking_rgbd(
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
-def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):
+def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False, custom=False):
     if initialization:
         image_ab = image
     else:
+        # apply exposure compensation
         image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
+    
+    # for monocular SLAM
     if config["Training"]["monocular"]:
         return get_loss_mapping_rgb(config, image_ab, depth, viewpoint)
-    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
+    
+    # for RGB-D SLAM
+    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint, custom=custom)
 
 
 def get_loss_mapping_rgb(config, image, depth, viewpoint):
+    """ Loss for monocular SLAM mapping """
     gt_image = viewpoint.original_image.cuda()
     l1_rgb = torch.abs(image * viewpoint.rgb_pixel_mask_mapping - gt_image * viewpoint.rgb_pixel_mask_mapping)
 
     return l1_rgb.mean()
 
 
-def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
+def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False, custom=False):
+    """ Loss for RGB-D SLAM mapping """
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
     gt_image = viewpoint.original_image.cuda()
 
     rgb_pixel_mask = viewpoint.rgb_pixel_mask_mapping
-    depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+    depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape) # remove invalid depth
 
-    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    l1_depth = torch.abs(depth * depth_pixel_mask - viewpoint.gt_depth * depth_pixel_mask)
+    if custom:
+        l1_rgb = torch.nn.functional.l1_loss(image, gt_image)
+        l1_depth = torch.nn.functional.l1_loss(depth * depth_pixel_mask, viewpoint.gt_depth * depth_pixel_mask)
+        
+        return alpha * l1_rgb + (1 - alpha) * l1_depth
+    else:
+        l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+        l1_depth = torch.abs(depth * depth_pixel_mask - viewpoint.gt_depth * depth_pixel_mask)
 
-    return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+        return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
 
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):
@@ -123,3 +135,64 @@ def get_median_depth(depth, opacity=None, mask=None, return_std=False):
     if return_std:
         return valid_depth.median(), valid_depth.std(), valid
     return valid_depth.median()
+
+
+# ===================== For Keypoint Matching ===================== #
+def points_in_mask(pts, mask):
+    """
+    Check if 2D points lie within the mask.
+    
+    Args:
+        pts: (N, 2) tensor of float coordinates [x, y] or [u, v]
+        mask: (H, W) binary mask tensor
+        
+    Returns:
+        (N,) boolean tensor indicating if each point is in the mask
+    """
+    # Floor to get the pixel indices (top-left corner of pixel containing the point)
+    pts_int = torch.floor(pts).long()
+    
+    # Get image dimensions
+    H, W = mask.shape
+    
+    # Check bounds
+    valid_x = (pts_int[:, 0] >= 0) & (pts_int[:, 0] < W)
+    valid_y = (pts_int[:, 1] >= 0) & (pts_int[:, 1] < H)
+    valid_bounds = valid_x & valid_y
+    
+    # Initialize result
+    in_mask = torch.zeros(pts.shape[0], dtype=torch.bool, device=pts.device)
+    
+    # Check mask values for valid points
+    valid_indices = torch.where(valid_bounds)[0]
+    if len(valid_indices) > 0:
+        x_valid = pts_int[valid_indices, 0]
+        y_valid = pts_int[valid_indices, 1]
+        in_mask[valid_indices] = mask[y_valid, x_valid] > 0
+    
+    # Filter points
+    pts_valid = pts[in_mask, :].int()
+    
+    return pts_valid, in_mask
+
+
+def pts_image_to_cam(uv_coords, depth, K_inv):
+    """ project image pixel coordinates to camera coordinates """
+    if depth.ndim == 1:
+        depth_values = depth
+    elif depth.ndim == 2:
+        # depth is [H, W]
+        depth_values = depth[uv_coords[:, 1], uv_coords[:, 0]]  # (N,)
+    else:
+        # depth is [H, W, 1]
+        depth_values = depth[uv_coords[:, 1], uv_coords[:, 0], 0]  # (N,)
+    
+    # Create homogeneous image coordinates
+    N = uv_coords.shape[0]
+    ones = torch.ones(N, 1, device=uv_coords.device)
+    pixel_coords = torch.cat((uv_coords.float(), ones), dim=1)  # (N,3)
+    
+    # get camera coordinates
+    cam_coords = (K_inv @ pixel_coords.T).T * depth_values.unsqueeze(1)  # (N,3)
+    
+    return cam_coords
